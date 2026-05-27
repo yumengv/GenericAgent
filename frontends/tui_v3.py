@@ -1035,6 +1035,116 @@ def fold_segments(text: str) -> list[FoldSegment]:
 _render_cache: dict[tuple[int, int], object] = {}
 _CACHE_MAX = 200
 
+_LATEX_GREEK = {
+    'alpha': 'α', 'beta': 'β', 'gamma': 'γ', 'delta': 'δ', 'epsilon': 'ε',
+    'theta': 'θ', 'lambda': 'λ', 'mu': 'μ', 'pi': 'π', 'rho': 'ρ',
+    'sigma': 'σ', 'phi': 'φ', 'omega': 'ω', 'Delta': 'Δ', 'Theta': 'Θ',
+    'Lambda': 'Λ', 'Pi': 'Π', 'Sigma': 'Σ', 'Phi': 'Φ', 'Omega': 'Ω',
+}
+_LATEX_SYMBOLS = {
+    r'\times': '×', r'\cdot': '·', r'\div': '÷', r'\pm': '±', r'\mp': '∓',
+    r'\leq': '≤', r'\le': '≤', r'\geq': '≥', r'\ge': '≥', r'\neq': '≠',
+    r'\approx': '≈', r'\sim': '∼', r'\infty': '∞', r'\to': '→', r'\rightarrow': '→',
+    r'\leftarrow': '←', r'\Rightarrow': '⇒', r'\in': '∈', r'\notin': '∉',
+    r'\subset': '⊂', r'\subseteq': '⊆', r'\cup': '∪', r'\cap': '∩',
+    r'\sum': 'Σ', r'\prod': 'Π', r'\int': '∫', r'\partial': '∂', r'\nabla': '∇',
+    r'\sqrt': '√',
+}
+_SUPERSCRIPT_TRANS = str.maketrans('0123456789+-=()n', '⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿ')
+_SUBSCRIPT_TRANS = str.maketrans('0123456789+-=()abcdefghijklmnopqrstuvwxyz', '₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐᵦ꜀ᑯₑբ₉ₕᵢⱼₖₗₘₙₒₚ૧ᵣₛₜᵤᵥｗₓᵧ₂')
+
+
+def _latex_read_group(s: str, start: int) -> tuple[str, int] | None:
+    """Read a single braced LaTeX group starting at start."""
+    if start >= len(s) or s[start] != '{':
+        return None
+    depth = 0
+    out: list[str] = []
+    i = start
+    while i < len(s):
+        ch = s[i]
+        if ch == '{':
+            if depth:
+                out.append(ch)
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                return ''.join(out), i + 1
+            out.append(ch)
+        else:
+            out.append(ch)
+        i += 1
+    return None
+
+
+def _plain_latex_math(expr: str) -> str:
+    """Convert common inline LaTeX math to terminal-readable Unicode/plain text."""
+    expr = expr.strip()
+    expr = re.sub(r'\\(?:left|right)\s*', '', expr)
+
+    def frac_repl(m: re.Match) -> str:
+        num = _plain_latex_math(m.group(1))
+        den = _plain_latex_math(m.group(2))
+        return f'{num}⁄{den}'
+
+    prev = None
+    while prev != expr:
+        prev = expr
+        expr = re.sub(r'\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}', frac_repl, expr)
+
+    def sqrt_repl(m: re.Match) -> str:
+        return f'√({_plain_latex_math(m.group(1))})'
+
+    expr = re.sub(r'\\sqrt\s*\{([^{}]*)\}', sqrt_repl, expr)
+    for name, glyph in _LATEX_GREEK.items():
+        expr = re.sub(rf'\\{name}(?![A-Za-z])', glyph, expr)
+    for src, dst in sorted(_LATEX_SYMBOLS.items(), key=lambda kv: -len(kv[0])):
+        expr = expr.replace(src, dst)
+    expr = re.sub(r'\^\{([^{}]+)\}', lambda m: m.group(1).translate(_SUPERSCRIPT_TRANS), expr)
+    expr = re.sub(r'_\{([^{}]+)\}', lambda m: m.group(1).translate(_SUBSCRIPT_TRANS), expr)
+    expr = re.sub(r'\^([A-Za-z0-9+\-=()])', lambda m: m.group(1).translate(_SUPERSCRIPT_TRANS), expr)
+    expr = re.sub(r'_([A-Za-z0-9+\-=()])', lambda m: m.group(1).translate(_SUBSCRIPT_TRANS), expr)
+    expr = expr.replace('\\,', ' ').replace('\\;', ' ').replace('\\:', ' ')
+    expr = expr.replace('\\ ', ' ')
+    expr = expr.replace('{', '').replace('}', '')
+    expr = re.sub(r'\\([A-Za-z]+)', r'\1', expr)
+    return re.sub(r'\s+', ' ', expr).strip()
+
+
+def _replace_latex_delimiters(text: str) -> str:
+    """Replace LaTeX math delimiters outside code blocks."""
+    def block_repl(m: re.Match) -> str:
+        return '\n' + _plain_latex_math(m.group(1)) + '\n'
+
+    text = re.sub(r'\\\[([\s\S]*?)\\\]', block_repl, text)
+    text = re.sub(r'\$\$([\s\S]*?)\$\$', block_repl, text)
+    text = re.sub(r'\\\(([\s\S]*?)\\\)', lambda m: _plain_latex_math(m.group(1)), text)
+    text = re.sub(r'(?<!\\)\$([^$\n]+?)(?<!\\)\$', lambda m: _plain_latex_math(m.group(1)), text)
+    return text.replace(r'\$', '$')
+
+
+def _preprocess_latex_math(text: str) -> str:
+    """Make common LaTeX math readable in terminals; leave fenced code unchanged."""
+    parts: list[str] = []
+    buf: list[str] = []
+    in_code = False
+    for line in text.split('\n'):
+        if line.strip().startswith('```'):
+            if not in_code and buf:
+                parts.append(_replace_latex_delimiters('\n'.join(buf)))
+                buf = []
+            elif in_code and buf:
+                parts.append('\n'.join(buf))
+                buf = []
+            parts.append(line)
+            in_code = not in_code
+        else:
+            buf.append(line)
+    if buf:
+        parts.append(('\n'.join(buf)) if in_code else _replace_latex_delimiters('\n'.join(buf)))
+    return '\n'.join(parts)
+
 
 class HardBreakMarkdown(Markdown):
     """Markdown that treats softbreaks as hardbreaks, preserving code blocks."""
@@ -1062,7 +1172,7 @@ def _markdown_to_text(cleaned: str, width: int) -> Text:
     buf = StringIO()
     Console(file=buf, width=max(1, width), force_terminal=True,
             color_system='truecolor', legacy_windows=False
-            ).print(HardBreakMarkdown(cleaned), end='')
+            ).print(HardBreakMarkdown(_preprocess_latex_math(cleaned)), end='')
     return Text.from_ansi(buf.getvalue().rstrip('\n'))
 
 
@@ -1685,7 +1795,7 @@ def _render(text: str, width: int, markdown: bool) -> list[str]:
     buf = StringIO()
     Console(file=buf, width=width, force_terminal=True, color_system='truecolor',
             legacy_windows=False, theme=_MD_THEME).print(
-        HardBreakMarkdown(text, code_theme='monokai') if markdown else Text(text),
+        HardBreakMarkdown(_preprocess_latex_math(text), code_theme='monokai') if markdown else Text(text),
         end='')
     out = _strip_bg(buf.getvalue()).split('\n')
     if out and out[-1] == '':
